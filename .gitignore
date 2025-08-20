@@ -10,3 +10,6 @@ dist/
 # Env
 *.env
 .env
+
+# Logs
+simulator/data/
