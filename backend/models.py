@@ -12,7 +12,8 @@ class CacheItem(Base):
     last_updated_ts = Column(TIMESTAMP(timezone=True), nullable=False)
     ttl_s = Column(Integer, nullable=False)
     inserted_ts = Column(TIMESTAMP(timezone=True), server_default=func.now(), nullable=False)
-
+    last_access_ts = Column(TIMESTAMP(timezone=True))  # nullable initially
+    
 class Request(Base):
     __tablename__ = "requests"
     id = Column(BigInteger, primary_key=True, index=True)
