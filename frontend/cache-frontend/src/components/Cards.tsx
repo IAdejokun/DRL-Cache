@@ -17,12 +17,14 @@ export function StatCard({
         borderRadius: 12,
         boxShadow: "0 1px 3px #00000010",
         background: "#fff",
+        // force dark text inside the white card so dark themes don't hide it
+        color: "#111",
       }}
     >
       <div style={{ fontSize: 12, color: "#777", marginBottom: 6 }}>
         {title}
       </div>
-      <div style={{ fontSize: 24, fontWeight: 600 }}>
+      <div style={{ fontSize: 28, fontWeight: 700, lineHeight: 1.2 }}>
         {value}
         {suffix}
       </div>
