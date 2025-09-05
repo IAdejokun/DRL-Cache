@@ -1,8 +1,11 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { api } from "../lib/api";
 import type { Stats } from "../lib/api";
+// If you have HistoryRow exported from api.ts, uncomment this import:
+// import type { HistoryRow } from "../lib/api";
 import { StatCard } from "../components/Cards";
 import {
+  ResponsiveContainer,
   LineChart,
   Line,
   XAxis,
@@ -12,6 +15,13 @@ import {
   Legend,
 } from "recharts";
 
+type HistoryRowLocal = {
+  ts: string;
+  hit_ratio_pct: number;
+  avg_latency_ms: number;
+  staleness_pct: number;
+};
+// Use HistoryRow from api.ts if available; otherwise this local type is fine.
 type Row = {
   t: number;
   hit_ratio_pct: number;
@@ -22,23 +32,30 @@ type Row = {
 export default function Overview() {
   const [stats, setStats] = useState<Stats | null>(null);
   const [series, setSeries] = useState<Row[]>([]);
-  const timer = useRef<number | null>(null);
 
   useEffect(() => {
     const pull = async () => {
       try {
-        const s = await api.stats();
+        const [s, h] = await Promise.all([
+          api.stats(),
+          api.history(120) as Promise<HistoryRowLocal[]>, // or HistoryRow[] if you import it
+        ]);
         setStats(s);
-        setSeries((prev) => [...prev.slice(-120), { t: Date.now(), ...s }]); // keep last ~2min @1Hz
+        setSeries(
+          h.map((r) => ({
+            t: new Date(r.ts).getTime(),
+            hit_ratio_pct: r.hit_ratio_pct,
+            avg_latency_ms: r.avg_latency_ms,
+            staleness_pct: r.staleness_pct,
+          }))
+        );
       } catch {
-        // ignore one-off errors
+        // swallow transient errors
       }
     };
     pull();
-    timer.current = window.setInterval(pull, 1000); // 1Hz
-    return () => {
-      if (timer.current) window.clearInterval(timer.current);
-    };
+    const id = window.setInterval(pull, 1000);
+    return () => window.clearInterval(id);
   }, []);
 
   const latest = stats ?? {
@@ -49,7 +66,10 @@ export default function Overview() {
 
   const chartData = useMemo(
     () =>
-      series.map((r) => ({ time: new Date(r.t).toLocaleTimeString(), ...r })),
+      series.map((r) => ({
+        time: new Date(r.t).toLocaleTimeString(),
+        ...r,
+      })),
     [series]
   );
 
@@ -84,35 +104,50 @@ export default function Overview() {
         }}
       >
         <h4 style={{ margin: "6px 0 12px" }}>Live Metrics</h4>
-        <LineChart width={980} height={320} data={chartData}>
-          <CartesianGrid strokeDasharray="3 3" />
-          <XAxis dataKey="time" />
-          <YAxis yAxisId="left" />
-          <YAxis yAxisId="right" orientation="right" />
-          <Tooltip />
-          <Legend />
-          <Line
-            yAxisId="left"
-            type="monotone"
-            dataKey="hit_ratio_pct"
-            name="Hit Ratio (%)"
-            dot={false}
-          />
-          <Line
-            yAxisId="right"
-            type="monotone"
-            dataKey="avg_latency_ms"
-            name="Avg Latency (ms)"
-            dot={false}
-          />
-          <Line
-            yAxisId="left"
-            type="monotone"
-            dataKey="staleness_pct"
-            name="Staleness (%)"
-            dot={false}
-          />
-        </LineChart>
+
+        {chartData.length === 0 ? (
+          <div style={{ padding: 12, color: "#777" }}>
+            No data yet — start a replay from the Experiments page.
+          </div>
+        ) : (
+          <ResponsiveContainer width="100%" height={320}>
+            <LineChart data={chartData}>
+              <CartesianGrid strokeDasharray="3 3" />
+              <XAxis dataKey="time" />
+              <YAxis yAxisId="left" />
+              <YAxis yAxisId="right" orientation="right" />
+              <Tooltip
+                formatter={(v: number, name: string) => {
+                  if (name.includes("Latency"))
+                    return [`${v.toFixed(2)} ms`, name];
+                  return [`${v.toFixed(2)} %`, name];
+                }}
+              />
+              <Legend />
+              <Line
+                yAxisId="left"
+                type="monotone"
+                dataKey="hit_ratio_pct"
+                name="Hit Ratio (%)"
+                dot={false}
+              />
+              <Line
+                yAxisId="right"
+                type="monotone"
+                dataKey="avg_latency_ms"
+                name="Avg Latency (ms)"
+                dot={false}
+              />
+              <Line
+                yAxisId="left"
+                type="monotone"
+                dataKey="staleness_pct"
+                name="Staleness (%)"
+                dot={false}
+              />
+            </LineChart>
+          </ResponsiveContainer>
+        )}
       </div>
     </div>
   );

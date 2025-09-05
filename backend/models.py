@@ -44,4 +44,23 @@ class AgentEvent(Base):
     action = Column(Text, nullable=False)
     reward = Column(BigInteger)  # keep simple; can switch to Float later
     object_id = Column(Text, index=True)
+
+class Run(Base):
+    __tablename__ = "runs"
+    id = Column(BigInteger, primary_key=True)
+    started_ts = Column(TIMESTAMP(timezone=True), server_default=func.now(), nullable=False)
+    workload = Column(Text, nullable=False)
+    minutes = Column(Integer, nullable=False)
+    rps = Column(Integer, nullable=False)
+    rate = Column(Integer, nullable=False)
+    status = Column(Text, nullable=False, server_default="running")
+
+class StatSnapshot(Base):
+    __tablename__ = "stat_snapshots"
+    id = Column(BigInteger, primary_key=True)
+    ts = Column(TIMESTAMP(timezone=True), server_default=func.now(), nullable=False)
+    run_id = Column(BigInteger, ForeignKey("runs.id", ondelete="SET NULL"), nullable=True)
+    hit_ratio_pct = Column(Integer)          # store as numeric; doubles fine too
+    avg_latency_ms = Column(Integer)
+    staleness_pct = Column(Integer)
   

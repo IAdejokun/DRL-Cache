@@ -1,19 +1,27 @@
 # backend/main.py - the FastAPI app: startup config, CORS, and the endpoints.
 import os, datetime
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text, func, case
 from sqlalchemy.orm import Session
 from dotenv import load_dotenv
 from pathlib import Path
+import subprocess, sys, threading, time
+from typing import Optional
 
-
-from db import Base, engine, get_db
+from db import Base, engine, get_db, SessionLocal
 import models
 from schemas import RequestIn, OutcomeOut, StatsOut
 
+
 #load_dotenv()  # reads .env
 load_dotenv(dotenv_path=Path(__file__).parent / ".env")  # use .env in the same directory as this file
+
+SAMPLE_HZ = 1  # once per second
+
+SIM_DIR = os.getenv("SIM_DIR", "../simulator")
+PY_EXE = os.getenv("PY_EXE", "python")
+
 
 # --- Settings (read once) ---
 DEFAULT_TTL = int(os.getenv("CACHE_DEFAULT_TTL_S", "300"))
@@ -33,9 +41,34 @@ app.add_middleware(
 )
 
 # Create tables if they don't exist
+
+# @app.on_event("startup")
+# def on_startup():
+#     Base.metadata.create_all(bind=engine)
+
+def sample_stats_loop():
+    with SessionLocal() as db:  # reuse your SessionLocal from db.py
+        while True:
+            # read current stats using same logic as /api/stats
+            hit_avg = db.query(func.avg(case((models.Outcome.cache_hit == True, 1), else_=0))).scalar() or 0.0
+            avg_latency = db.query(func.avg(models.Outcome.served_latency_ms)).scalar() or 0.0
+            stale_avg = db.query(func.avg(case((models.Outcome.staleness_s > 0, 1), else_=0))).scalar() or 0.0
+
+            snap = models.StatSnapshot(
+                run_id=None,  # we’ll attach a run_id when a run is active (optional)
+                hit_ratio_pct=round(100.0*float(hit_avg),2),
+                avg_latency_ms=round(float(avg_latency),2),
+                staleness_pct=round(100.0*float(stale_avg),2),
+            )
+            db.add(snap)
+            db.commit()
+            time.sleep(1.0 / SAMPLE_HZ)
+
 @app.on_event("startup")
 def on_startup():
     Base.metadata.create_all(bind=engine)
+    threading.Thread(target=sample_stats_loop, daemon=True).start()
+
 
 @app.get("/health")
 def health():
@@ -209,3 +242,68 @@ def get_stats(db: Session = Depends(get_db)):
         avg_latency_ms=round(float(avg_latency), 2),
         staleness_pct=round(100.0 * float(stale_avg), 2),
     )
+
+@app.get("/api/history")
+def get_history(window: int = Query(120, ge=10, le=3600), run_id: Optional[int] = None, db: Session = Depends(get_db)):
+    q = db.query(models.StatSnapshot).order_by(models.StatSnapshot.ts.desc())
+    if run_id is not None:
+        q = q.filter(models.StatSnapshot.run_id == run_id)
+    rows = q.limit(window).all()
+    # reverse chronological → chronological
+    rows = list(reversed(rows))
+    return [
+        {
+            "ts": r.ts.isoformat(),
+            "hit_ratio_pct": float(r.hit_ratio_pct or 0),
+            "avg_latency_ms": float(r.avg_latency_ms or 0),
+            "staleness_pct": float(r.staleness_pct or 0),
+        } for r in rows
+    ]
+
+@app.get("/api/runs")
+def list_runs(db: Session = Depends(get_db)):
+    rows = db.query(models.Run).order_by(models.Run.id.desc()).limit(20).all()
+    return [
+        { "id": r.id, "started_ts": r.started_ts.isoformat(),
+          "workload": r.workload, "minutes": r.minutes, "rps": r.rps,
+          "rate": r.rate, "status": r.status }
+        for r in rows
+    ]
+
+@app.post("/api/experiments/run")
+def run_experiment(payload: dict, db: Session = Depends(get_db)):
+    workload = payload.get("workload", "zipf")          # zipf|flash|writeheavy
+    minutes = int(payload.get("minutes", 2))
+    rps     = int(payload.get("rps", 5))
+    rate    = int(payload.get("rate", 10))
+
+    # Create a run row
+    run = models.Run(workload=workload, minutes=minutes, rps=rps, rate=rate, status="running")
+    db.add(run); db.commit(); db.refresh(run)
+
+    # Build CSV path and command
+    csv_path = os.path.abspath(os.path.join(SIM_DIR, f"data/run_{run.id}.csv"))
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+
+    make_cmd = [PY_EXE, os.path.join(SIM_DIR, "make_csv.py"),
+                "--workload", workload, "--minutes", str(minutes),
+                "--rps", str(rps), "--objects", "200", "--clients", "50",
+                "--outfile", csv_path]
+
+    replay_cmd = [PY_EXE, os.path.join(SIM_DIR, "replay.py"),
+                  "--file", csv_path, "--base", "http://127.0.0.1:8000",
+                  "--rate", str(rate)]
+
+    def worker():
+        try:
+            subprocess.check_call(make_cmd)
+            subprocess.check_call(replay_cmd)
+            run.status = "done"
+        except Exception as e:
+            run.status = "error"
+        finally:
+            with SessionLocal() as s:
+                s.merge(run); s.commit()
+
+    threading.Thread(target=worker, daemon=True).start()
+    return {"run_id": run.id, "status": "started"}
