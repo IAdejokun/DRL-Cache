@@ -49,6 +49,10 @@ export const api = {
   history: (window = 120) =>
     getJSON<HistoryRow[]>(`/api/history?window=${window}`),
   runs: () => getJSON<RunRow[]>("/api/runs"),
+  simulate: (mode: string) =>
+  fetch(`${BASE}/simulate?mode=${mode}`, {
+    method: "POST",
+  }).then((r) => r.json()),
   startRun: async (payload: {
     workload: string;
     minutes: number;

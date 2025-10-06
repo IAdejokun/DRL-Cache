@@ -1,8 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../lib/api";
 import type { Stats } from "../lib/api";
-// If you have HistoryRow exported from api.ts, uncomment this import:
-// import type { HistoryRow } from "../lib/api";
 import { StatCard } from "../components/Cards";
 import {
   ResponsiveContainer,
@@ -21,7 +19,7 @@ type HistoryRowLocal = {
   avg_latency_ms: number;
   staleness_pct: number;
 };
-// Use HistoryRow from api.ts if available; otherwise this local type is fine.
+
 type Row = {
   t: number;
   hit_ratio_pct: number;
@@ -32,13 +30,30 @@ type Row = {
 export default function Overview() {
   const [stats, setStats] = useState<Stats | null>(null);
   const [series, setSeries] = useState<Row[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [message, setMessage] = useState("");
+
+  // Function to trigger backend simulation
+  const handleSimulate = async (mode: string) => {
+    try {
+      setLoading(true);
+      setMessage(`Starting ${mode.toUpperCase()} simulation...`);
+      const res = await api.simulate(mode);
+      setMessage(`Simulation (${mode}) started: ${res.status || "OK"}`);
+    } catch (err) {
+      console.error(err);
+      setMessage(`Failed to start ${mode} simulation.`);
+    } finally {
+      setLoading(false);
+    }
+  };
 
   useEffect(() => {
     const pull = async () => {
       try {
         const [s, h] = await Promise.all([
           api.stats(),
-          api.history(120) as Promise<HistoryRowLocal[]>, // or HistoryRow[] if you import it
+          api.history(120) as Promise<HistoryRowLocal[]>,
         ]);
         setStats(s);
         setSeries(
@@ -50,7 +65,7 @@ export default function Overview() {
           }))
         );
       } catch {
-        // swallow transient errors
+        // ignore transient errors
       }
     };
     pull();
@@ -75,6 +90,20 @@ export default function Overview() {
 
   return (
     <div>
+      {/* Simulation Controls */}
+      <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
+        <button disabled={loading} onClick={() => handleSimulate("ttl")}>
+          Run TTL Mode
+        </button>
+        <button disabled={loading} onClick={() => handleSimulate("drl")}>
+          Run DRL Mode
+        </button>
+        <button disabled={loading} onClick={() => handleSimulate("hybrid")}>
+          Run Hybrid Mode
+        </button>
+      </div>
+      {message && <div style={{ marginBottom: 16, color: "#555" }}>{message}</div>}
+
       <div
         style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 16 }}
       >
@@ -104,10 +133,9 @@ export default function Overview() {
         }}
       >
         <h4 style={{ margin: "6px 0 12px" }}>Live Metrics</h4>
-
         {chartData.length === 0 ? (
           <div style={{ padding: 12, color: "#777" }}>
-            No data yet — start a replay from the Experiments page.
+            No data yet — start a simulation to see metrics.
           </div>
         ) : (
           <ResponsiveContainer width="100%" height={320}>

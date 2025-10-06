@@ -1,21 +1,53 @@
 # backend/main.py - the FastAPI app: startup config, CORS, and the endpoints.
-import os, datetime
+# top-of-file imports (replace your existing import block)
+import os
+import sys
+import random
+import time
+import subprocess
+import threading
+from pathlib import Path
+from typing import Optional
+from dotenv import load_dotenv
+
 from fastapi import FastAPI, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text, func, case
 from sqlalchemy.orm import Session
-from dotenv import load_dotenv
-from pathlib import Path
-import subprocess, sys, threading, time
-from typing import Optional
 
 from db import Base, engine, get_db, SessionLocal
 import models
 from schemas import RequestIn, OutcomeOut, StatsOut
 
+# datetime imports — use timezone-aware datetimes consistently
+from datetime import datetime, timezone, timedelta
+
 
 #load_dotenv()  # reads .env
 load_dotenv(dotenv_path=Path(__file__).parent / ".env")  # use .env in the same directory as this file
+
+# ensure repo root is on sys.path so `rl_agent` can be imported when running from backend/
+REPO_ROOT = Path(__file__).resolve().parents[1]  # ../ from backend/
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+# --- DRL Agent loading ---
+AGENT = None
+MODEL_PATH = os.getenv("MODEL_PATH", os.path.join(os.path.dirname(__file__), "..", "rl_agent", "model.pt"))
+
+try:
+    import torch
+    # ensure rl_agent package is importable; path assumed relative to repo root
+    from rl_agent.dqn import DQNAgent
+    # state_dim must match env (5)
+    if os.path.exists(MODEL_PATH):
+        AGENT = DQNAgent.load(MODEL_PATH, state_dim=5)
+        print("Loaded DRL agent from", MODEL_PATH)
+    else:
+        print("DRL model not found at", MODEL_PATH, "; DRL mode will fallback to TTL.")
+except Exception as e:
+    AGENT = None
+    print("DRL agent not available:", repr(e))
 
 SAMPLE_HZ = 1  # once per second
 
@@ -69,6 +101,111 @@ def on_startup():
     Base.metadata.create_all(bind=engine)
     threading.Thread(target=sample_stats_loop, daemon=True).start()
 
+# --- Simple in-memory cache simulation for testing ---
+# in-memory cache_store: key -> (inserted_ts: datetime, value, size_bytes:int)
+cache_store = {}
+# Use DEFAULT_TTL (env) for simulation TTL by default
+CACHE_TTL = DEFAULT_TTL
+
+def cache_bytes_used():
+    return sum(int(v[2]) for v in cache_store.values())
+
+def _make_object_id(n: int) -> str:
+    return f"item{n}"
+
+def predict_drl_action(obs):
+    """
+    obs: list/np array length=5 (same as train env observation)
+    returns: integer action 0/1
+    """
+    if AGENT is None:
+        return 0  # fallback: do nothing cache-wise (acts like TTL fallback)
+    # no exploration at inference: epsilon=0.0
+    try:
+        return AGENT.act(obs, epsilon=0.0)
+    except Exception as e:
+        print("Error during agent act:", e)
+        return 0
+
+def simulate_request(mode: str = "ttl"):
+    """
+    In-memory simulation for /api/simulate.
+    Returns:
+      object_id (str), hit (bool), served_latency_ms (float), staleness_s (float), size_bytes (int)
+    """
+    # choose an object
+    key_num = random.randint(1, 10)
+    object_id = _make_object_id(key_num)
+    now = now_utc()
+
+    # check in-memory cache
+    entry = cache_store.get(object_id)
+    in_cache = False
+    age_s = None
+    size_bytes = random.randint(5 * 1024, 500 * 1024)  # default simulated size
+
+    if entry:
+        inserted_ts, value, stored_size = entry
+        age_s = (now - inserted_ts).total_seconds()
+        size_bytes = stored_size or size_bytes
+        in_cache = (age_s <= CACHE_TTL)
+
+    # Mode: TTL
+    if mode == "ttl":
+        if in_cache:
+            # hit
+            served_latency = float(HIT_MS)
+            staleness = max(0.0, age_s) if age_s is not None else 0.0
+            # touch for LRU semantics in in-memory cache
+            cache_store[object_id] = (now, value, size_bytes)
+            return object_id, True, served_latency, staleness, size_bytes
+        else:
+            # miss -> fetch origin, insert into cache
+            origin_latency = random.uniform(100, 200)
+            cache_store[object_id] = (now, random.random(), size_bytes)
+            return object_id, False, float(origin_latency), 0.0, size_bytes
+
+    # Mode: DRL (use AGENT on same in-memory state)
+    if mode == "drl":
+        # build observation [key_norm, in_cache, age_norm, cache_fill_frac, size_norm]
+        key_norm = key_num / 10.0
+        in_cache_f = 1.0 if in_cache else 0.0
+        age_norm = min((age_s / float(CACHE_TTL)) if age_s is not None else 1.0, 1.0)
+        fill_frac = min(cache_bytes_used() / float(MAX_BYTES), 1.0) if MAX_BYTES else 0.0
+        size_norm = size_bytes / float(MAX_BYTES) if MAX_BYTES else 0.0
+        obs = [key_norm, float(in_cache_f), float(age_norm), float(fill_frac), float(size_norm)]
+
+        action = predict_drl_action(obs)  # 0 or 1
+        if action == 1:
+            # cache/refresh
+            cache_store[object_id] = (now, random.random(), size_bytes)
+            served_latency = float(HIT_MS)
+            staleness = 0.0 if not in_cache else (age_s or 0.0)
+            return object_id, True, served_latency, staleness, size_bytes
+        else:
+            # do not cache or refresh: serve from cache if still valid, else origin
+            if in_cache:
+                served_latency = float(HIT_MS)
+                staleness = max(0.0, age_s or 0.0)
+                # keep the entry but update LRU timestamp
+                cache_store[object_id] = (now, entry[1], size_bytes)
+                return object_id, True, served_latency, staleness, size_bytes
+            else:
+                origin_latency = random.uniform(100, 200)
+                # no caching on this action
+                return object_id, False, float(origin_latency), 0.0, size_bytes
+
+    # Mode: HYBRID (simple mix)
+    if mode == "hybrid":
+        # use DRL action if agent available, otherwise TTL
+        if AGENT:
+            return simulate_request("drl")
+        else:
+            return simulate_request("ttl")
+
+    # default fallback: TTL-like
+    return simulate_request("ttl")
+
 
 @app.get("/health")
 def health():
@@ -82,7 +219,7 @@ def health_db(db: Session = Depends(get_db)):
 # time & capacity utilities
 
 def now_utc():
-    return datetime.datetime.now(datetime.timezone.utc)
+    return datetime.now(timezone.utc)
 
 def total_cache_bytes(db: Session) -> int:
     return int(db.query(func.coalesce(func.sum(models.CacheItem.size_bytes), 0)).scalar() or 0)
@@ -307,3 +444,53 @@ def run_experiment(payload: dict, db: Session = Depends(get_db)):
 
     threading.Thread(target=worker, daemon=True).start()
     return {"run_id": run.id, "status": "started"}
+
+    
+@app.post("/api/simulate")
+def run_simulation(
+    mode: str = Query("ttl", enum=["ttl", "drl", "hybrid"]),
+    db: Session = Depends(get_db)
+):
+    total_requests = 50
+    hits, total_latency, total_staleness = 0, 0.0, 0.0
+
+    for _ in range(total_requests):
+        object_id, hit, served_latency, staleness_s, size_bytes = simulate_request(mode)
+        total_latency += served_latency
+        total_staleness += staleness_s
+        if hit:
+            hits += 1
+
+        # create a Request row for traceability (similar to handle_request)
+        q = models.Request(
+            ts=now_utc(),
+            client_id="sim",
+            object_id=object_id,
+            object_size_bytes=size_bytes,
+            origin_latency_ms=served_latency if not hit else HIT_MS,
+            was_write=False,
+        )
+        db.add(q)
+        db.flush()  # assign q.id
+
+        # Store Outcome using consistent column names
+        outcome = models.Outcome(
+            request_id=q.id if hasattr(q, "id") else None,
+            cache_hit=bool(hit),
+            served_latency_ms=float(served_latency),
+            staleness_s=float(staleness_s),
+        )
+        db.add(outcome)
+        db.commit()
+
+    avg_latency = total_latency / total_requests
+    hit_ratio = (hits / total_requests) * 100
+    avg_staleness = (total_staleness / total_requests) * 100
+
+    return {
+        "mode": mode,
+        "total_requests": total_requests,
+        "hit_ratio_pct": round(hit_ratio, 2),
+        "avg_latency_ms": round(avg_latency, 2),
+        "staleness_pct": round(avg_staleness, 2),
+    }
