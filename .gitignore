@@ -13,3 +13,8 @@ dist/
 
 # Logs
 simulator/data/
+
+# RL models & logs
+/rl_agent/models/*.pt
+/rl_agent/logs/
+/backend_uvicorn_*.log  

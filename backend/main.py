@@ -6,11 +6,13 @@ import random
 import time
 import subprocess
 import threading
+import json
+import glob
 from pathlib import Path
 from typing import Optional
 from dotenv import load_dotenv
 
-from fastapi import FastAPI, Depends, Query
+from fastapi import FastAPI, Depends, Query, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text, func, case
 from sqlalchemy.orm import Session
@@ -22,9 +24,8 @@ from schemas import RequestIn, OutcomeOut, StatsOut
 # datetime imports — use timezone-aware datetimes consistently
 from datetime import datetime, timezone, timedelta
 
-
-#load_dotenv()  # reads .env
-load_dotenv(dotenv_path=Path(__file__).parent / ".env")  # use .env in the same directory as this file
+# load .env placed next to backend/main.py
+load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 
 # ensure repo root is on sys.path so `rl_agent` can be imported when running from backend/
 REPO_ROOT = Path(__file__).resolve().parents[1]  # ../ from backend/
@@ -52,8 +53,7 @@ except Exception as e:
 SAMPLE_HZ = 1  # once per second
 
 SIM_DIR = os.getenv("SIM_DIR", "../simulator")
-PY_EXE = os.getenv("PY_EXE", "python")
-
+PY_EXE = os.getenv("PY_EXE", sys.executable or "python")
 
 # --- Settings (read once) ---
 DEFAULT_TTL = int(os.getenv("CACHE_DEFAULT_TTL_S", "300"))
@@ -73,10 +73,6 @@ app.add_middleware(
 )
 
 # Create tables if they don't exist
-
-# @app.on_event("startup")
-# def on_startup():
-#     Base.metadata.create_all(bind=engine)
 
 def sample_stats_loop():
     with SessionLocal() as db:  # reuse your SessionLocal from db.py
@@ -295,7 +291,7 @@ def upsert_cache_item(db: Session, object_id: str, size_bytes: int, ttl_s: int =
 def handle_request(req: RequestIn, db: Session = Depends(get_db)):
     # 1) Insert request
     q = models.Request(
-        ts=datetime.datetime.fromisoformat(req.ts.replace("Z","+00:00")),
+        ts=datetime.fromisoformat(req.ts.replace("Z","+00:00")),
         client_id=req.client_id,
         object_id=req.object_id,
         object_size_bytes=req.object_size_bytes,
@@ -343,6 +339,136 @@ def handle_request(req: RequestIn, db: Session = Depends(get_db)):
         served_latency_ms=served_latency,
         staleness_s=staleness,
     )
+
+# --------------------- Day 10: model registry & training/eval endpoints ---------------------
+
+# Setup RL agent models directory & registry import (file-based registry living in rl_agent/models/)
+RL_AGENT_DIR = REPO_ROOT / "rl_agent"
+RL_MODELS_DIR = RL_AGENT_DIR / "models"
+RL_MODELS_DIR.mkdir(parents=True, exist_ok=True)
+
+# Try to import registry helpers; provide safe fallback if not available.
+try:
+    from rl_agent.registry import list_models, add_model_entry, find_model_by_id
+except Exception as e:
+    print("Could not import rl_agent.registry:", e)
+    # fallback in-memory listing (not persisted) — small shim
+    _REGISTRY_FALLBACK = []
+    def list_models():
+        return _REGISTRY_FALLBACK
+    def add_model_entry(p, meta=None):
+        entry = {"id": datetime.utcnow().strftime("%Y%m%d%H%M%S"), "path": str(p), "created_ts": datetime.utcnow().isoformat() + "Z", "meta": meta or {}}
+        _REGISTRY_FALLBACK.append(entry)
+        return entry
+    def find_model_by_id(mid):
+        for m in _REGISTRY_FALLBACK:
+            if m["id"] == mid:
+                return m
+        return None
+
+def _train_background(trace: str, epochs: int, out_name: str):
+    """
+    Runs a training subprocess and registers the resulting model on success.
+    out_name should be a filename under rl_agent/models (e.g. model_20251006.pt)
+    """
+    out_path = str((RL_MODELS_DIR / out_name).resolve())
+    cmd = [PY_EXE, str(RL_AGENT_DIR / "train_offline.py"),
+           "--trace", trace, "--epochs", str(epochs), "--out", out_path]
+    try:
+        print("Starting training subprocess:", " ".join(cmd))
+        subprocess.check_call(cmd)
+        # register model
+        entry = add_model_entry(out_path, meta={"trace": trace, "epochs": epochs})
+        print("Training finished, registered model:", entry)
+    except Exception as e:
+        print("Training failed:", repr(e))
+
+@app.post("/api/models/train")
+def api_train_model(payload: dict, background: BackgroundTasks = None):
+    """
+    Starts a background training job.
+    payload: { "trace": "simulator/data/run_1.csv", "epochs": 20 }
+    Returns a job handle (best-effort).
+    """
+    trace = payload.get("trace", str(REPO_ROOT / "simulator" / "data" / "run_1.csv"))
+    epochs = int(payload.get("epochs", 20))
+    # generate deterministic name
+    out_name = f"model_{int(time.time())}.pt"
+
+    # Basic validation
+    if not Path(trace).exists():
+        raise HTTPException(status_code=400, detail=f"Trace file not found: {trace}")
+
+    # fire-and-forget: use BackgroundTasks if available, else thread
+    if background is not None:
+        background.add_task(_train_background, trace, epochs, out_name)
+    else:
+        threading.Thread(target=_train_background, args=(trace, epochs, out_name), daemon=True).start()
+
+    return {"status": "started", "trace": trace, "epochs": epochs, "out_name": out_name}
+
+@app.get("/api/models")
+def api_list_models():
+    return list_models()
+
+@app.post("/api/models/evaluate")
+def api_evaluate_model(payload: dict):
+    """
+    Evaluate a model on a given trace (synchronous).
+    payload: { "model_id": "<id>" , "trace": "simulator/data/run_1.csv", "out": "rl_agent/logs/eval_XXX.csv", "plot": false }
+    """
+    model_id = payload.get("model_id")
+    trace = payload.get("trace", str(REPO_ROOT / "simulator" / "data" / "run_1.csv"))
+    out = payload.get("out", str(REPO_ROOT / "rl_agent" / "logs" / f"eval_{int(time.time())}.csv"))
+    plot = bool(payload.get("plot", False))
+
+    model_entry = None
+    model_path = None
+    if model_id:
+        model_entry = find_model_by_id(model_id)
+        if not model_entry:
+            raise HTTPException(status_code=404, detail="Model id not found")
+        model_path = model_entry["path"]
+    else:
+        model_path = payload.get("model_path")  # allow direct path
+        if model_path and not Path(model_path).exists():
+            raise HTTPException(status_code=400, detail=f"model_path not found: {model_path}")
+        if not model_path:
+            raise HTTPException(status_code=400, detail="model_id or model_path required")
+
+    # use evaluation helpers from rl_agent.evaluate
+    try:
+        from rl_agent.evaluate import evaluate_ttl_from_trace, evaluate_drl_from_trace, save_report_csv, plot_comparison
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Evaluate module import failed: {e}")
+
+    ttl_metrics = evaluate_ttl_from_trace(trace)
+    drl_metrics = None
+    if model_path and Path(model_path).exists():
+        drl_metrics = evaluate_drl_from_trace(trace, model_path)
+    # Ensure output directory exists
+    out_path = Path(out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    save_report_csv(str(out_path), ttl_metrics, drl_metrics)
+    if plot:
+        plot_path = str(out_path.with_suffix(".png"))
+        plot_comparison(ttl_metrics, drl_metrics, save_path=plot_path)
+
+    return {"out": str(out_path), "ttl": ttl_metrics, "drl": drl_metrics}
+
+# Optional: auto-retrain poller (disabled by default; enable if you want automated retraining)
+def auto_retrain_poller(poll_dir: str = str(REPO_ROOT / "simulator" / "data"), interval_s: int = 60):
+    seen = set()
+    while True:
+        files = sorted(glob.glob(os.path.join(poll_dir, "*.csv")))
+        for f in files:
+            if f not in seen:
+                seen.add(f)
+                threading.Thread(target=_train_background, args=(f, 5, f"auto_{int(time.time())}.pt"), daemon=True).start()
+        time.sleep(interval_s)
+
+# threading.Thread(target=auto_retrain_poller, daemon=True).start()
+# ----------------------------------------------------------------------------------------
 
 @app.get("/api/cache")
 def get_cache(db: Session = Depends(get_db)):
@@ -445,7 +571,6 @@ def run_experiment(payload: dict, db: Session = Depends(get_db)):
     threading.Thread(target=worker, daemon=True).start()
     return {"run_id": run.id, "status": "started"}
 
-    
 @app.post("/api/simulate")
 def run_simulation(
     mode: str = Query("ttl", enum=["ttl", "drl", "hybrid"]),
