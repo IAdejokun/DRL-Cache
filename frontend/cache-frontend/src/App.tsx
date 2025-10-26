@@ -29,6 +29,7 @@ export default function App() {
         {link("/", "Overview")}
         {link("/cache", "Cache")}
         {link("/experiments", "Experiments")}
+        {link("/models", "Models")} 
       </div>
       <Outlet />
     </div>

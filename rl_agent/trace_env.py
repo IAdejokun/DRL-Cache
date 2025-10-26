@@ -1,181 +1,158 @@
 # rl_agent/trace_env.py
 import pandas as pd
 import numpy as np
-from collections import OrderedDict
-from datetime import datetime, timezone
 import random
-from typing import List, Dict, Any
+import os
 
 class TraceEnv:
     """
-    Replay environment driven by a CSV trace (simulator output).
-    Observations: [key_norm, in_cache(0/1), age_norm, cache_fill_frac, size_norm]
-    Actions: 0 -> no cache/refresh, 1 -> cache/refresh
-    Handles writes: increments origin_version for that object.
+    Environment wrapper for CSV traces.
+    Supports alias fallback:
+        - ts (aliases: timestamp, time, datetime, request_ts)
+        - key (aliases: cache_key, object_id, id, item)
+        - size (aliases: size, bytes, content_length, object_size, object_size_bytes)
+        - was_write (aliases: was_write, write_flag, is_write, write, op, operation, op_type)
     """
 
-    def __init__(
-        self,
-        csv_path: str,
-        max_bytes: int = 50_000_000,
-        ttl_s: int = 300,
-        hit_latency_ms: int = 20,
-        seed: int | None = None,
-    ):
+    def __init__(self, csv_path, max_bytes=50_000_000, ttl_s=300, hit_latency_ms=20, seed=42):
         self.csv_path = csv_path
-        self.df = pd.read_csv(csv_path)
-        # normalize column names to lower
-        self.df.columns = [c.lower() for c in self.df.columns]
-        # required columns mapping
-        req_cols = ["ts", "client_id", "object_id", "object_size_bytes", "origin_latency_ms", "was_write"]
-        for c in req_cols:
-            if c not in self.df.columns:
-                raise ValueError(f"Trace missing required column: {c}")
-        # Convert was_write to bool
-        self.df["was_write"] = self.df["was_write"].astype(str).str.lower().map(lambda v: v in ("1", "true", "t", "yes"))
-        self.df = self.df.reset_index(drop=True)
-        self.index = 0
         self.max_bytes = max_bytes
         self.ttl_s = ttl_s
         self.hit_latency_ms = hit_latency_ms
-        self.seed = seed
-        self.rng = random.Random(seed)
 
-        # build object id -> numeric index map for normalization
-        unique_ids = list(self.df["object_id"].unique())
-        self.key_to_idx = {k: i+1 for i, k in enumerate(unique_ids)}  # 1..N
-        self.num_keys = max(1, len(unique_ids))
+        random.seed(seed)
+        np.random.seed(seed)
 
-        # origin versions: object_id -> int (increment on writes)
-        self.origin_version = {k: 0 for k in unique_ids}
+        if not os.path.exists(csv_path):
+            raise FileNotFoundError(f"Trace file not found: {csv_path}")
 
-        # in-memory cache: object_id -> dict with inserted_ts, size_bytes, origin_version_at_store, last_access_ts
-        self.cache: "OrderedDict[str, Dict[str,Any]]" = OrderedDict()
-        self.bytes_used = 0
+        self.df = pd.read_csv(csv_path)
+
+        # Expected columns + aliases mapping
+        required_mapping = {
+            "ts": ["ts", "timestamp", "time", "datetime", "request_ts"],
+            "key": ["key", "cache_key", "object_id", "id", "item"],
+            "size": ["size", "bytes", "content_length", "object_size", "object_size_bytes"],
+            "was_write": ["was_write", "write_flag", "is_write", "write", "op", "operation", "op_type"]
+        }
+
+        renamed_columns = {}
+        for canon, aliases in required_mapping.items():
+            if canon not in self.df.columns:
+                found = None
+                for alias in aliases:
+                    if alias in self.df.columns:
+                        found = alias
+                        break
+                if found:
+                    renamed_columns[found] = canon
+                else:
+                    raise ValueError(f"Trace missing required column or alias for: {canon} (aliases tried: {aliases})")
+
+        if renamed_columns:
+            print(f"[TraceEnv] Auto-alias mapping applied: {renamed_columns}")
+            self.df.rename(columns=renamed_columns, inplace=True)
+
+        # ✅ Normalize timestamp to numeric values (seconds since first event)
+        if not np.issubdtype(self.df["ts"].dtype, np.number):
+            try:
+                start_ts = pd.to_datetime(self.df["ts"].iloc[0])
+                self.df["ts"] = (pd.to_datetime(self.df["ts"]) - start_ts).dt.total_seconds()
+                print("[TraceEnv] Converted timestamp column to numeric seconds")
+            except Exception:
+                raise ValueError("Column 'ts' could not be converted to numeric timestamps")
+
+        # ✅ Normalize size to numeric just in case
+        self.df["size"] = pd.to_numeric(self.df["size"], errors="coerce").fillna(0)
+
+        # ✅ Normalize was_write to 0/1
+        if self.df["was_write"].dtype == object:
+            self.df["was_write"] = self.df["was_write"].apply(
+                lambda x: 1 if str(x).lower() in ["1", "true", "w", "write"] else 0
+            )
+
+        # Sort by timestamp
+        self.df.sort_values("ts", inplace=True, ascending=True)
+        self.df.reset_index(drop=True, inplace=True)
+
+        self.cache = {}  # key -> (expiry_time, size)
+        self.current_bytes = 0
+        self.index = 0
+        self.total_requests = len(self.df)
 
     def reset(self):
-        self.index = 0
         self.cache.clear()
-        self.bytes_used = 0
-        # return first obs
-        return self._make_obs_for_row(self.df.iloc[self.index])
+        self.current_bytes = 0
+        self.index = 0
+        if self.total_requests == 0:
+            raise ValueError("CSV loaded but empty.")
+        return self._get_obs()
 
-    def _make_obs_for_row(self, row):
-        object_id = row["object_id"]
-        idx = self.key_to_idx.get(object_id, 1)
-        key_norm = idx / float(self.num_keys)
-        entry = self.cache.get(object_id)
-        in_cache = 0
-        age_norm = 1.0
-        size_bytes = int(row["object_size_bytes"]) if not np.isnan(row["object_size_bytes"]) else 1024
-        if entry:
-            in_cache = 1
-            age_s = (datetime.now(timezone.utc) - entry["inserted_ts"]).total_seconds()
-            age_norm = min(age_s / float(self.ttl_s), 1.0)
-            size_bytes = int(entry["size_bytes"])
-        fill_frac = min(self.bytes_used / float(self.max_bytes), 1.0) if self.max_bytes else 0.0
-        obs = [key_norm, float(in_cache), float(age_norm), float(fill_frac), float(size_bytes) / float(self.max_bytes or 1)]
-        meta = {"object_id": object_id, "size_bytes": int(size_bytes), "row": row}
-        return np.array(obs, dtype=np.float32), meta
+    def _get_obs(self):
+        if self.index >= self.total_requests:
+            return None, {}
+        row = self.df.iloc[self.index]
+        key = row["key"]
+        in_cache = 1 if key in self.cache and self.cache[key][0] > row["ts"] else 0
+        remaining_ttl = 0
+        if key in self.cache:
+            expiry = self.cache[key][0]
+            remaining_ttl = max(0, expiry - row["ts"])
 
-    def _evict_until_fit(self, size_needed: int):
-        while self.bytes_used + size_needed > self.max_bytes and len(self.cache) > 0:
-            k, v = self.cache.popitem(last=False)
-            self.bytes_used -= int(v["size_bytes"])
+        obs = np.array([
+            in_cache,
+            self.current_bytes,
+            row["size"],
+            remaining_ttl,
+            row["was_write"]
+        ], dtype=np.float32)
+        return obs, {}
 
-    def step(self, action: int):
-        """
-        Process current trace row using action.
-        Returns: next_obs, reward, done, info
-        """
-        if self.index >= len(self.df):
+    def step(self, action):
+        if self.index >= self.total_requests:
             return None, 0.0, True, {}
 
         row = self.df.iloc[self.index]
-        object_id = row["object_id"]
-        size_bytes = int(row["object_size_bytes"])
-        was_write = bool(row["was_write"])
-        origin_latency = float(row["origin_latency_ms"]) if not np.isnan(row["origin_latency_ms"]) else float(self.hit_latency_ms)
+        key, size, ts, is_write = row["key"], row["size"], row["ts"], row["was_write"]
 
-        # update origin on write BEFORE serving (origin changes)
-        if was_write:
-            self.origin_version[object_id] = self.origin_version.get(object_id, 0) + 1
-
-        entry = self.cache.get(object_id)
-        in_cache = False
-        cached_version = None
-        age_s = None
-        if entry:
-            # check TTL
-            age_s = (datetime.now(timezone.utc) - entry["inserted_ts"]).total_seconds()
-            in_cache = age_s <= self.ttl_s
-            cached_version = entry["origin_version"]
-
-        # determine served_latency and stale
-        served_latency = None
-        stale = False
         served_from_cache = False
+        stale = False
 
-        # If action == 1 -> force cache/refresh (agent decided to cache)
-        if action == 1:
-            # evict if needed
-            self._evict_until_fit(size_bytes)
-            # insert or refresh with current origin version
-            self.cache.pop(object_id, None)
-            self.cache[object_id] = {"inserted_ts": datetime.now(timezone.utc), "size_bytes": size_bytes, "origin_version": self.origin_version.get(object_id, 0), "last_access_ts": datetime.now(timezone.utc)}
-            self.bytes_used += size_bytes
-            served_latency = float(self.hit_latency_ms)
-            served_from_cache = True
-            # fresh if inserted now, stale False
-            stale = False
-        else:
-            # action == 0, do not actively cache; serve from cache if valid, else origin
-            if in_cache and cached_version == self.origin_version.get(object_id, 0):
-                # fresh cache hit
-                served_latency = float(self.hit_latency_ms)
+        if key in self.cache:
+            expiry, obj_size = self.cache[key]
+            if expiry >= ts:
                 served_from_cache = True
-                stale = False
-                # touch for LRU
-                e = self.cache.pop(object_id)
-                e["last_access_ts"] = datetime.now(timezone.utc)
-                self.cache[object_id] = e
-            elif in_cache and cached_version != self.origin_version.get(object_id, 0):
-                # cache hit BUT stale (origin was updated after we cached)
-                served_latency = float(self.hit_latency_ms)
+            else:
                 served_from_cache = True
                 stale = True
-                # keep cache entry but note staleness
-                e = self.cache.pop(object_id)
-                e["last_access_ts"] = datetime.now(timezone.utc)
-                self.cache[object_id] = e
-            else:
-                # miss -> origin
-                served_latency = float(origin_latency)
-                served_from_cache = False
-                stale = False
-                # note: TTL baseline may decide to upsert on write; we only upsert if policy instructs (trainer/policy will do)
-        # reward calculation (simple)
-        latency_saved = (origin_latency - served_latency) / 100.0
-        cache_cost = (size_bytes / float(self.max_bytes)) * 0.5 if action == 1 else 0.0
-        fill_penalty = (self.bytes_used / float(self.max_bytes)) * 0.2
-        reward = latency_saved - cache_cost - fill_penalty
+
+        if action == 1 or is_write == 1:
+            while self.current_bytes + size > self.max_bytes and self.cache:
+                evict_key = next(iter(self.cache))
+                _, evict_size = self.cache.pop(evict_key)
+                self.current_bytes -= evict_size
+
+            expiry_ts = ts + self.ttl_s
+            if key not in self.cache:
+                self.current_bytes += size
+            self.cache[key] = (expiry_ts, size)
+            served_from_cache = True
+            stale = False
+
+        if served_from_cache and not stale:
+            latency = self.hit_latency_ms
+        else:
+            latency = self.hit_latency_ms * 5
+
+        reward = 1 if served_from_cache and not stale else -1
 
         info = {
-            "object_id": object_id,
-            "served_latency_ms": served_latency,
+            "served_latency_ms": latency,
             "served_from_cache": served_from_cache,
-            "stale": stale,
-            "origin_latency_ms": origin_latency,
-            "size_bytes": int(size_bytes),
-            "was_write": was_write
+            "stale": stale
         }
 
-        # move pointer
         self.index += 1
-        done = self.index >= len(self.df)
+        done = self.index >= self.total_requests
 
-        next_obs, _ = (None, None)
-        if not done:
-            next_obs, _ = self._make_obs_for_row(self.df.iloc[self.index])
-
-        return next_obs, float(reward), done, info
+        return self._get_obs()[0] if not done else None, reward, done, info

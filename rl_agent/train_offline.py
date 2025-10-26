@@ -74,7 +74,6 @@ if __name__ == "__main__":
     p.add_argument("--ttl-s", type=int, default=300)
     p.add_argument("--hit-ms", type=int, default=20)
     p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--epsilon-start", type=float, default=1.0)
     p.add_argument("--epsilon-final", type=float, default=0.05)
     p.add_argument("--epsilon-decay", type=float, default=0.995)

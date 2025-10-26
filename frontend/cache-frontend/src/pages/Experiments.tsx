@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { api } from "../lib/api";
 import type { RunRow } from "../lib/api";
+import {startRun} from "../lib/api";
 
 export default function Experiments() {
   const [workload, setWorkload] = useState("zipf");
@@ -16,7 +17,7 @@ export default function Experiments() {
   }, []);
 
   const start = async () => {
-    await api.startRun({ workload, minutes, rps, rate });
+    await startRun({ workload, minutes, rps, rate });
     await refresh();
   };
 

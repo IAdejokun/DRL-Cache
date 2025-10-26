@@ -5,6 +5,7 @@ import App from "./App";
 import Overview from "./pages/Overview";
 import Cache from "./pages/Cache";
 import Experiments from "./pages/Experiments";
+import ModelsPanel from "./components/ModelsPanel"; // 
 import "./index.css";
 
 const router = createBrowserRouter([
@@ -15,6 +16,7 @@ const router = createBrowserRouter([
       { index: true, element: <Overview /> },
       { path: "cache", element: <Cache /> },
       { path: "experiments", element: <Experiments /> },
+      { path: "models", element: <ModelsPanel /> }, // 
     ],
   },
 ]);

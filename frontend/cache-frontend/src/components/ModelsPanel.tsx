@@ -1,28 +1,55 @@
 // frontend/src/components/ModelsPanel.tsx
-import React, { useEffect, useState } from "react";
-import { models as fetchModels, trainModel, evaluateModel } from "../lib/api";
-import type { ModelEntry, TrainResponse, EvaluateResponse } from "../lib/api";
+import { Fragment, useEffect, useState } from "react";
+import {
+  models as fetchModels,
+  trainModel,
+  evaluateModel,
+  getModelReport,
+  getActiveModel,
+  promoteModel,
+  resetModelRegistry,
+  type ModelEntry,
+  type EvalRow,
+  type EvaluateResponse,
+} from "../lib/api";
 
-export default function ModelsPanel(): React.ReactElement {
+export default function ModelsPanel() {
   const [list, setList] = useState<ModelEntry[]>([]);
-  const [loading, setLoading] = useState<boolean>(false);
-  const [trace, setTrace] = useState<string>("/simulator/data/run_1.csv");
-  const [epochs, setEpochs] = useState<number>(20);
+  const [loading, setLoading] = useState(false);
+  const [trace, setTrace] = useState("/simulator/data/run_1.csv");
+  const [epochs, setEpochs] = useState(20);
   const [status, setStatus] = useState<string | null>(null);
-  const [actionBusy, setActionBusy] = useState<boolean>(false);
+  const [expandedModelId, setExpandedModelId] = useState<string | null>(null);
+  const [reportData, setReportData] = useState<Record<string, EvalRow[]>>({});
+  const [active, setActive] = useState<{ path: string | null; loaded: boolean } | null>(null);
+
 
   const load = async () => {
-    setLoading(true);
-    try {
-      const data = await fetchModels();
-      setList(data ?? []);
-    } catch (err) {
-      console.error(err);
-      setStatus(String(err));
-    } finally {
-      setLoading(false);
-    }
-  };
+  setLoading(true);
+  try {
+    const [data, activeInfo] = await Promise.all([fetchModels(), getActiveModel()]);
+    setList(data);
+    setActive(activeInfo);
+  } catch (e) {
+    console.error(e);
+    setStatus(String(e));
+  } finally {
+    setLoading(false);
+  }
+};
+
+  const onPromote = async (id: string) => {
+  setStatus("promoting...");
+  try {
+    await promoteModel({ model_id: id });
+    const a = await getActiveModel();
+    setActive(a);
+    setStatus("model promoted and reloaded");
+  } catch (e) {
+    setStatus("promote error: " + String(e));
+  }
+};
+
 
   useEffect(() => {
     load();
@@ -30,88 +57,195 @@ export default function ModelsPanel(): React.ReactElement {
 
   const onTrain = async () => {
     setStatus("starting training...");
-    setActionBusy(true);
     try {
-      const res: TrainResponse = await trainModel({ trace, epochs });
-      const outName = res.out_name ?? "(unknown)";
-      setStatus(`training started: out=${outName}`);
-      // refresh list after a short delay to allow registry to be written
-      setTimeout(load, 1500);
+      const res = await trainModel({ trace, epochs });
+      setStatus(`training started: out=${res.out_name}`);
+      setTimeout(load, 1200);
     } catch (e) {
-      console.error(e);
       setStatus("train error: " + String(e));
-    } finally {
-      setActionBusy(false);
     }
   };
 
-  type EvaluatePayload = {
-    model_id?: string;
-    trace: string;
-    plot: boolean;
-  };
-
-  const onEvaluate = async (id?: string) => {
+  const onEvaluate = async (model: ModelEntry) => {
     setStatus("evaluating...");
-    setActionBusy(true);
     try {
-      const payload: EvaluatePayload = { trace, plot: false };
-      if (id) payload.model_id = id;
+      // Send model path explicitly (backend also supports model_id)
+      const payload = { path: model.path, trace, plot: false };
       const res: EvaluateResponse = await evaluateModel(payload);
-      setStatus(`eval done; out=${res.out}`);
+      setStatus(`eval done; csv=${res.eval_log}`);
+
+      // Immediately pull the parsed report for this model
+      try {
+        const r = await getModelReport(model.id);
+        if (Array.isArray(r.rows)) {
+          setReportData((prev) => ({ ...prev, [model.id]: r.rows }));
+          setExpandedModelId(model.id);
+        } else {
+          setReportData((prev) => ({ ...prev, [model.id]: [] }));
+          setExpandedModelId(model.id);
+        }
+      } catch (err) {
+        setStatus("Report fetch error: " + String(err));
+      }
+
+      setTimeout(load, 800);
     } catch (e) {
-      console.error(e);
       setStatus("eval error: " + String(e));
-    } finally {
-      setActionBusy(false);
     }
   };
+
+  const onViewReport = async (modelId: string) => {
+    if (expandedModelId === modelId) {
+      setExpandedModelId(null);
+      return;
+    }
+    setStatus("fetching report...");
+    try {
+      const res = await getModelReport(modelId);
+      if (Array.isArray(res.rows)) {
+        setReportData((prev) => ({ ...prev, [modelId]: res.rows }));
+      } else {
+        setReportData((prev) => ({ ...prev, [modelId]: [] }));
+      }
+      setExpandedModelId(modelId);
+      setStatus(null);
+    } catch (e) {
+      setStatus("report error: " + String(e));
+    }
+  };
+
+  const renderReportBlock = (modelId: string) => {
+  const rows = reportData[modelId];
+
+  // Dark-friendly container so text always has contrast
+  return (
+    <tr key={`${modelId}-report`}>
+      <td colSpan={4} style={{ background: "#1f1f1f", padding: 10 }}>
+        {rows === undefined ? (
+          <div style={{ padding: 8, color: "#ddd", fontStyle: "italic" }}>
+            No report loaded.
+          </div>
+        ) : rows.length === 0 ? (
+          <div style={{ padding: 8, color: "#ddd", fontStyle: "italic" }}>
+            Report has no rows yet. If you just evaluated, click “View Report” again in a moment.
+          </div>
+        ) : (
+          <table
+            style={{
+              width: "100%",
+              borderCollapse: "collapse",
+              background: "#222",      // dark background
+              color: "#fff",           // visible text on dark
+              border: "1px solid #444",
+              borderRadius: 6,
+              overflow: "hidden",
+            }}
+          >
+            <thead>
+              <tr>
+                {["Policy", "Total", "Hits", "Hit Ratio %", "Avg Latency (ms)", "Stale %"].map((h) => (
+                  <th
+                    key={h}
+                    style={{
+                      textAlign: h === "Policy" ? "left" : "right",
+                      padding: 8,
+                      borderBottom: "1px solid #333",
+                      fontWeight: 600,
+                    }}
+                  >
+                    {h}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row, i) => (
+                <tr key={`${modelId}-r-${i}`}>
+                  <td style={{ padding: 8, borderBottom: "1px solid #333", textAlign: "left" }}>
+                    {row.policy}
+                  </td>
+                  <td style={{ padding: 8, borderBottom: "1px solid #333", textAlign: "right" }}>
+                    {row.total}
+                  </td>
+                  <td style={{ padding: 8, borderBottom: "1px solid #333", textAlign: "right" }}>
+                    {row.hits}
+                  </td>
+                  <td style={{ padding: 8, borderBottom: "1px solid #333", textAlign: "right" }}>
+                    {row.hit_ratio_pct}
+                  </td>
+                  <td style={{ padding: 8, borderBottom: "1px solid #333", textAlign: "right" }}>
+                    {row.avg_latency_ms}
+                  </td>
+                  <td style={{ padding: 8, borderBottom: "1px solid #333", textAlign: "right" }}>
+                    {row.stale_pct}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </td>
+    </tr>
+  );
+};
+
 
   return (
     <div style={{ padding: 12 }}>
       <h3>Model Registry & Training</h3>
-
       <div style={{ marginBottom: 8 }}>
-        <label style={{ marginRight: 8 }}>Trace file:</label>
-        <input
-          value={trace}
-          onChange={(e) => setTrace(e.target.value)}
-          style={{ width: 360 }}
-        />
+        <label>Trace file: </label>
+        <input value={trace} onChange={(e) => setTrace(e.target.value)} style={{ width: 360 }} />
       </div>
-
       <div style={{ marginBottom: 8 }}>
-        <label style={{ marginRight: 8 }}>Epochs:</label>
-        <input
-          type="number"
-          value={epochs}
-          onChange={(e) => setEpochs(Number(e.target.value))}
-          style={{ width: 100 }}
-          min={1}
-        />
+        <label>Epochs: </label>
+        <input type="number" value={epochs} onChange={(e) => setEpochs(Number(e.target.value))} style={{ width: 100 }} />
       </div>
-
-      <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
-        <button onClick={onTrain} disabled={actionBusy}>
-          {actionBusy ? "Working..." : "Start Training"}
-        </button>
-        <button onClick={() => onEvaluate(undefined)} disabled={actionBusy}>
-          Evaluate TTL only
-        </button>
-        <button onClick={load} disabled={loading}>
-          Refresh list
-        </button>
-      </div>
+      <button onClick={onTrain}>Start Training</button>{" "}
+      <button
+        onClick={async () => {
+          setStatus("evaluating TTL only...");
+          try {
+            // If you want a TTL-only button, point to your /api/models/evaluate with a dummy path or separate TTL endpoint.
+            // For now we just call evaluate with trace and an empty path (backend will ignore model specifics).
+            const res: EvaluateResponse = await evaluateModel({ trace, plot: false, path: "" });
+            setStatus(`ttl-only eval done; csv=${res.eval_log}`);
+          } catch (e) {
+            setStatus("eval error: " + String(e));
+          }
+        }}
+      >
+        Evaluate TTL only
+      </button>{" "}
+      <button
+        onClick={async () => {
+          try {
+            await resetModelRegistry();
+            setReportData({});
+            setExpandedModelId(null);
+            setStatus("Registry cleared");
+            await load();
+          } catch (e) {
+            setStatus("Reset error: " + String(e));
+          }
+        }}
+      >
+        Clear Registry
+      </button>
 
       <div style={{ marginTop: 12 }}>
         <strong>Status:</strong> {status ?? "idle"}
       </div>
 
+    <div style={{ marginTop: 12 }}>
+  <strong>Active model:</strong>{" "}
+  {active?.path ? <span title={active.path}>{active.loaded ? "Loaded" : "Not loaded"} — {active.path}</span> : "None"}
+  </div>
+
+      
       <h4 style={{ marginTop: 16 }}>Available Models</h4>
       {loading ? (
         <div>Loading...</div>
-      ) : list.length === 0 ? (
-        <div style={{ padding: 12, color: "#777" }}>No models registered yet.</div>
       ) : (
         <table style={{ width: "100%", borderCollapse: "collapse" }}>
           <thead>
@@ -124,18 +258,21 @@ export default function ModelsPanel(): React.ReactElement {
           </thead>
           <tbody>
             {list.map((m) => (
-              <tr key={m.id}>
-                <td style={{ padding: 6, verticalAlign: "top", fontFamily: "monospace" }}>{m.id}</td>
-                <td style={{ padding: 6 }}>
-                  {m.created_ts ? new Date(m.created_ts).toLocaleString() : "—"}
-                </td>
-                <td style={{ padding: 6, fontSize: 12, wordBreak: "break-all" }}>{m.path}</td>
-                <td style={{ padding: 6 }}>
-                  <button onClick={() => onEvaluate(m.id)} disabled={actionBusy}>
-                    Evaluate
-                  </button>
-                </td>
-              </tr>
+              <Fragment key={m.id}>
+                <tr>
+                  <td style={{ padding: 6 }}>{m.id}</td>
+                  <td style={{ padding: 6 }}>{new Date(m.created_ts).toLocaleString()}</td>
+                  <td style={{ padding: 6, fontSize: 12, wordBreak: "break-all" }}>{m.path}</td>
+                  <td style={{ padding: 6 }}>
+                    <button onClick={() => onEvaluate(m)}>Evaluate</button>{" "}
+                    <button onClick={() => onViewReport(m.id)}>
+                      {expandedModelId === m.id ? "Hide Report" : "View Report"}
+                    </button>
+                    <button onClick={() => onPromote(m.id)}>Promote</button>
+                  </td>
+                </tr>
+                {expandedModelId === m.id && renderReportBlock(m.id)}
+              </Fragment>
             ))}
           </tbody>
         </table>
