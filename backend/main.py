@@ -1,4 +1,4 @@
-# backend/main.py - the FastAPI app: startup config, CORS, and the endpoints.
+# backend/main.py - FastAPI app: startup config, CORS, endpoints
 import os
 import sys
 import random
@@ -12,39 +12,36 @@ from pathlib import Path
 from typing import Optional, List, Dict, Any
 from dotenv import load_dotenv
 
-from fastapi import FastAPI, Depends, Query, BackgroundTasks, HTTPException, Response
+from fastapi import FastAPI, Depends, Query, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.exceptions import RequestValidationError
+
 from sqlalchemy import text, func, case
 from sqlalchemy.orm import Session
-
-from fastapi.responses import JSONResponse
-from fastapi.exceptions import RequestValidationError
-from settings import BASE_DIR as SETTINGS_BASE_DIR, REPO_ROOT as SETTINGS_REPO_ROOT, resolve_path, require_env
-
 
 from db import Base, engine, get_db, SessionLocal
 import models
 from schemas import RequestIn, OutcomeOut, StatsOut
 
-# timezone-aware datetimes
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 # --- load environment (backend/.env expected) ---
 load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# ensure repo root is on sys.path so `rl_agent` can be imported when running from backend/
-REPO_ROOT = Path(__file__).resolve().parents[1]  # ../ from backend/
+REPO_ROOT = Path(__file__).resolve().parents[1]  # repo root (../ from backend/)
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 # --- DRL Agent loading (best-effort) ---
 AGENT = None
-MODEL_PATH = os.getenv("MODEL_PATH", os.path.join(os.path.dirname(__file__), "..", "rl_agent", "model.pt"))
+MODEL_PATH = os.getenv(
+    "MODEL_PATH",
+    os.path.join(os.path.dirname(__file__), "..", "rl_agent", "model.pt")
+)
 
 try:
-    import torch  # optional
     from rl_agent.dqn import DQNAgent  # may fail if rl_agent not importable
     if os.path.exists(MODEL_PATH):
         AGENT = DQNAgent.load(MODEL_PATH, state_dim=5)
@@ -68,30 +65,16 @@ HIT_MS = int(os.getenv("CACHE_HIT_LATENCY_MS", "20"))
 
 app = FastAPI(title="DRL Cache Gateway")
 
+# Terse error surfaces for client; keep server logs for details
 @app.exception_handler(Exception)
 async def unhandled_exc_handler(request, exc):
-    # Keep it terse but helpful; don’t leak stacktraces to client
-    return JSONResponse(
-        status_code=500,
-        content={"detail": "Server error", "hint": str(exc)[:200]},
-    )
+    return JSONResponse(status_code=500, content={"detail": "Server error", "hint": str(exc)[:200]})
 
 @app.exception_handler(RequestValidationError)
 async def validation_exc_handler(request, exc):
-    return JSONResponse(
-        status_code=422,
-        content={"detail": "Validation error", "errors": exc.errors()},
-    )
+    return JSONResponse(status_code=422, content={"detail": "Validation error", "errors": exc.errors()})
 
-
-FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
-
-ALLOWED_ORIGINS = {
-    FRONTEND_ORIGIN,
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-}
-
+# --- CORS (localhost + 127.0.0.1) ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -103,15 +86,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-# Create tables if they don't exist and start stats sampler
+# --- Startup: create tables + sampler thread ---
 def sample_stats_loop():
     with SessionLocal() as db:
         while True:
             hit_avg = db.query(func.avg(case((models.Outcome.cache_hit == True, 1), else_=0))).scalar() or 0.0
             avg_latency = db.query(func.avg(models.Outcome.served_latency_ms)).scalar() or 0.0
             stale_avg = db.query(func.avg(case((models.Outcome.staleness_s > 0, 1), else_=0))).scalar() or 0.0
-
             snap = models.StatSnapshot(
                 run_id=None,
                 hit_ratio_pct=round(100.0 * float(hit_avg), 2),
@@ -128,7 +109,7 @@ def on_startup():
     threading.Thread(target=sample_stats_loop, daemon=True).start()
 
 # --- In-memory cache simulation helpers ---
-cache_store = {}
+cache_store: Dict[str, tuple] = {}
 CACHE_TTL = DEFAULT_TTL
 
 def cache_bytes_used():
@@ -145,22 +126,6 @@ def predict_drl_action(obs):
     except Exception as e:
         print("Error during agent act:", e)
         return 0
-
-def _resolve_trace_path(raw: str) -> str:
-    """
-    Resolve a trace path whether it's absolute, repo-relative, or backend-relative.
-    Raises HTTPException 400 if not found.
-    """
-    candidates = [
-        Path(raw),
-        REPO_ROOT / raw,
-        Path(BASE_DIR) / raw,
-    ]
-    for c in candidates:
-        if c.exists():
-            return str(c.resolve())
-    raise HTTPException(status_code=400, detail=f"Trace file not found via candidates: {', '.join(str(c) for c in candidates)}")
-
 
 def simulate_request(mode: str = "ttl"):
     key_num = random.randint(1, 10)
@@ -230,12 +195,17 @@ def health_db(db: Session = Depends(get_db)):
     db.execute(text("SELECT 1"))
     return {"db": "ok"}
 
-# time & capacity utilities
+# --- time & capacity utilities ---
 def now_utc():
     return datetime.now(timezone.utc)
 
 def total_cache_bytes(db: Session) -> int:
-    return int(db.query(func.coalesce(func.sum(models.CacheItem.size_bytes), 0)).scalar() or 0)
+    # Force int to avoid Decimal leaking out of SUM()
+    val = db.query(func.coalesce(func.sum(models.CacheItem.size_bytes), 0)).scalar()
+    try:
+        return int(val or 0)
+    except Exception:
+        return int(float(val or 0))
 
 def evict_until_fit(db: Session, size_needed: int):
     used = total_cache_bytes(db)
@@ -285,12 +255,12 @@ def upsert_cache_item(db: Session, object_id: str, size_bytes: int, ttl_s: int =
         ))
     db.flush()
 
+# --- Config probe (optional) ---
 REDACT = {"DATABASE_URL", "OPENAI_API_KEY"}
 
 @app.get("/api/config")
 def api_config_probe():
-    # Redact sensitive keys; expose helpful runtime info
-    env_pairs = {}
+    env_pairs: Dict[str, str] = {}
     for k, v in os.environ.items():
         if k in REDACT:
             env_pairs[k] = "***"
@@ -298,12 +268,12 @@ def api_config_probe():
             env_pairs[k] = v
     return {
         "cwd": os.getcwd(),
-        "base_dir": str(SETTINGS_BASE_DIR),
-        "repo_root": str(SETTINGS_REPO_ROOT),
+        "base_dir": str(BASE_DIR),
+        "repo_root": str(REPO_ROOT),
         "env": env_pairs,
     }
 
-
+# --- Request handling (records into DB) ---
 @app.post("/api/request", response_model=OutcomeOut)
 def handle_request(req: RequestIn, db: Session = Depends(get_db)):
     q = models.Request(
@@ -351,17 +321,15 @@ def handle_request(req: RequestIn, db: Session = Depends(get_db)):
         staleness_s=staleness,
     )
 
-# --------------------- Day 10: model registry & training/eval endpoints ---------------------
-
-# directories
+# --------------------- Model registry & training/eval ---------------------
 RL_AGENT_DIR = REPO_ROOT / "rl_agent"
 RL_MODELS_DIR = RL_AGENT_DIR / "models"
 RL_LOGS_DIR = RL_AGENT_DIR / "logs"
 RL_MODELS_DIR.mkdir(parents=True, exist_ok=True)
 RL_LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
-# registry json file
 REGISTRY_PATH = RL_MODELS_DIR / "registry.json"
+ACTIVE_MODEL_FILE = RL_AGENT_DIR / "model.pt"  # canonical active path
 
 def load_registry() -> List[Dict[str, Any]]:
     try:
@@ -369,9 +337,7 @@ def load_registry() -> List[Dict[str, Any]]:
             REGISTRY_PATH.write_text("[]")
             return []
         data = json.loads(REGISTRY_PATH.read_text())
-        if isinstance(data, list):
-            return data
-        return []
+        return data if isinstance(data, list) else []
     except Exception as e:
         print("Failed to load registry:", e)
         return []
@@ -392,29 +358,10 @@ def add_model_entry(path: str, meta: Optional[Dict[str, Any]] = None) -> Dict[st
         "path": str(path),
         "created_ts": ts,
         "meta": meta or {},
-        # last_eval will be added/updated by evaluate endpoint
     }
     entries.append(entry)
     save_registry(entries)
     return entry
-
-ACTIVE_MODEL_FILE = RL_AGENT_DIR / "model.pt"  # canonical active path
-
-def get_active_model_path() -> str | None:
-    if ACTIVE_MODEL_FILE.exists():
-        return str(ACTIVE_MODEL_FILE.resolve())
-    return None
-
-def load_agent_if_possible(model_path: str) -> bool:
-    global AGENT
-    try:
-        from rl_agent.dqn import DQNAgent
-        AGENT = DQNAgent.load(model_path, state_dim=5)
-        print(f"[MODEL] Active agent loaded from {model_path}")
-        return True
-    except Exception as e:
-        print(f"[MODEL] Failed to load agent: {e}")
-        return False
 
 def list_models() -> List[Dict[str, Any]]:
     return load_registry()
@@ -425,9 +372,25 @@ def find_model_by_id(mid: str) -> Optional[Dict[str, Any]]:
             return m
     return None
 
+def get_active_model_path() -> Optional[str]:
+    if ACTIVE_MODEL_FILE.exists():
+        return str(ACTIVE_MODEL_FILE.resolve())
+    return None
+
+def load_agent_if_possible(model_path: str) -> bool:
+    global AGENT, MODEL_PATH
+    try:
+        from rl_agent.dqn import DQNAgent
+        AGENT = DQNAgent.load(model_path, state_dim=5)
+        MODEL_PATH = model_path
+        print(f"[MODEL] Active agent loaded from {model_path}")
+        return True
+    except Exception as e:
+        print(f"[MODEL] Failed to load agent: {e}")
+        return False
+
 def _train_background(trace: str, epochs: int, out_name: str):
     out_path = str((RL_MODELS_DIR / out_name).resolve())
-    # run as module so rl_agent package imports work (requires PYTHONPATH to include repo root)
     cmd = [PY_EXE, "-m", "rl_agent.train_offline", "--trace", trace, "--epochs", str(epochs), "--out", out_path]
     env = os.environ.copy()
     env["PYTHONPATH"] = str(REPO_ROOT)
@@ -448,15 +411,14 @@ def api_models_active():
 def api_models_promote(payload: dict):
     """
     Promote a model to 'active':
-      - payload: { model_id?: str, model_path?: str }
+      - payload: { model_id?: str, model_path?: str, path?: str }
       - copies the chosen file to rl_agent/model.pt
       - attempts to hot-reload the in-memory agent
     """
     model_id = payload.get("model_id")
-    model_path = payload.get("model_path")
+    model_path = payload.get("model_path") or payload.get("path")  # accept 'path' alias
 
     chosen_path = None
-    chosen_entry = None
     if model_id:
         chosen_entry = find_model_by_id(str(model_id))
         if not chosen_entry:
@@ -474,37 +436,20 @@ def api_models_promote(payload: dict):
 
     ACTIVE_MODEL_FILE.parent.mkdir(parents=True, exist_ok=True)
 
-    # copy instead of symlink (Windows-friendly)
     try:
         data = src.read_bytes()
-        ACTIVE_MODEL_FILE.write_bytes(data)
+        ACTIVE_MODEL_FILE.write_bytes(data)  # Windows-friendly copy
         print(f"[MODEL] Promoted {src} -> {ACTIVE_MODEL_FILE}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to copy model: {e}")
 
-    # hot load
     ok = load_agent_if_possible(str(ACTIVE_MODEL_FILE))
     return {"status": "ok", "active": str(ACTIVE_MODEL_FILE), "loaded": ok}
 
-
 @app.post("/api/models/registry/reset")
 def api_models_registry_reset():
-    """
-    Wipes the file-based model registry and (optionally) deletes orphaned .pt files.
-    By default it just clears registry.json.
-    """
-    registry_path = RL_MODELS_DIR / "registry.json"
-    # clear the JSON file
-    registry_path.parent.mkdir(parents=True, exist_ok=True)
-    registry_path.write_text("[]", encoding="utf-8")
-
-    # OPTIONAL: also delete all .pt files. Comment out if you want to keep files.
-    # for p in RL_MODELS_DIR.glob("*.pt"):
-    #     try:
-    #         p.unlink()
-    #     except Exception:
-    #         pass
-
+    REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    REGISTRY_PATH.write_text("[]", encoding="utf-8")
     return {"status": "ok", "message": "registry cleared"}
 
 @app.post("/api/models/train")
@@ -512,19 +457,13 @@ def api_train_model(payload: dict, background: BackgroundTasks = None):
     trace = payload.get("trace", "simulator/data/run_1.csv")
 
     # Resolve trace path: try provided; repo relative; backend relative
-    trace_path = Path(trace)
-    alt_paths = [
-        trace_path,
-        REPO_ROOT / trace,
-        Path(__file__).resolve().parents[1] / trace,  # backend/../trace
-    ]
     trace_path = None
-    for p in alt_paths:
+    for p in [Path(trace), REPO_ROOT / trace, Path(__file__).resolve().parents[1] / trace]:
         if p.exists():
             trace_path = p
             break
     if trace_path is None:
-        raise HTTPException(status_code=400, detail=f"Trace file not found (tried): {alt_paths}")
+        raise HTTPException(status_code=400, detail=f"Trace file not found (tried repo/base): {trace}")
 
     epochs = int(payload.get("epochs", 20))
     out_name = f"model_{int(time.time())}.pt"
@@ -542,174 +481,134 @@ def api_train_model(payload: dict, background: BackgroundTasks = None):
 def api_list_models():
     return list_models()
 
-def _run_evaluate_module(trace: str, model_path: str, out_csv: str, plot_save: Optional[str] = None) -> None:
-    """
-    Fallback helper: run evaluation module as a subprocess if import fails.
-    Produces CSV at out_csv; optionally produces plot at plot_save.
-    """
-    cmd = [PY_EXE, "-m", "rl_agent.evaluate", "--trace", trace, "--model", model_path, "--out", out_csv]
-    if plot_save:
-        cmd.extend(["--plot", "--plot-save", plot_save])
-    env = os.environ.copy()
-    env["PYTHONPATH"] = str(REPO_ROOT)
-    print("Starting eval subprocess:", " ".join(cmd))
-    subprocess.check_call(cmd, env=env)
-
-
+# --- Evaluate: now supports TTL/LRU/LFU/DRL + extra knobs ---
 @app.post("/api/models/evaluate")
 def api_evaluate_model(payload: dict):
     """
-    Evaluate a model on a given trace (subprocess for isolation).
-    Accepts either { model_id } or { model_path }.
-    Returns: { out: <csv>, rows: [...], ttl: {...}, drl: {...} }
-    Also updates registry.json with last_eval {csv, ts}.
+    Evaluate a model on a given trace (synchronous).
+    Request: { model_id?: str, model_path?: str, trace?: str, out?: str, plot?: bool,
+               max_bytes?: int, ttl_s?: int, hit_ms?: int }
+    Response: { out: "<csv>", rows: [...], plot?: "<png>", max_bytes: int }
     """
     model_id = payload.get("model_id")
-    model_path = payload.get("model_path")
-    trace_in = payload.get("trace", "simulator/data/run_1.csv")
-    plot = bool(payload.get("plot", False))
+    trace_raw = payload.get("trace", "simulator/data/run_1.csv")
+    out_csv = payload.get("out") or str(RL_LOGS_DIR / f"eval_{int(time.time())}.csv")
+    want_plot = bool(payload.get("plot", False))
 
-    # --- Resolve model path ---
-    chosen_entry = None
+    # ---- new: tunables (fallback to env/defaults) ----
+    try:
+        max_bytes = int(payload.get("max_bytes")
+                        or os.getenv("CACHE_MAX_BYTES")
+                        or MAX_BYTES)
+    except Exception:
+        max_bytes = MAX_BYTES
+
+    ttl_s = int(payload.get("ttl_s", int(os.getenv("CACHE_DEFAULT_TTL_S", DEFAULT_TTL))))
+    hit_ms = int(payload.get("hit_ms", int(os.getenv("CACHE_HIT_LATENCY_MS", HIT_MS))))
+
+    # resolve model path
+    model_path = None
+    model_entry = None
     if model_id:
-        chosen_entry = find_model_by_id(str(model_id))
-        if not chosen_entry:
+        model_entry = find_model_by_id(str(model_id))
+        if not model_entry:
             raise HTTPException(status_code=404, detail="Model id not found")
-        model_path = chosen_entry.get("path")
+        model_path = model_entry.get("path")
+    else:
+        model_path = payload.get("model_path")
+
     if not model_path:
         raise HTTPException(status_code=400, detail="model_id or model_path required")
     if not Path(model_path).exists():
         raise HTTPException(status_code=400, detail=f"Model file not found: {model_path}")
 
-    # --- Resolve trace like /train ---
-    alt_paths = [
-        Path(trace_in),
-        REPO_ROOT / trace_in,
-        Path(__file__).resolve().parents[1] / trace_in,  # backend/../trace
-    ]
+    # resolve trace path like training
     trace_path = None
-    for p in alt_paths:
-        if p.exists():
-            trace_path = p
+    for candidate in [Path(trace_raw), REPO_ROOT / trace_raw, Path(__file__).resolve().parents[1] / trace_raw]:
+        if candidate.exists():
+            trace_path = candidate
             break
     if trace_path is None:
-        raise HTTPException(status_code=400, detail=f"Trace file not found (tried): {[str(p) for p in alt_paths]}")
+        raise HTTPException(status_code=400, detail=f"Trace file not found (tried): {trace_raw}")
 
-    # --- Output CSV (ensure logs dir exists) ---
-    RL_LOGS_DIR.mkdir(parents=True, exist_ok=True)
-    out_csv = RL_LOGS_DIR / f"eval_{int(time.time())}.csv"
-    plot_path = str(out_csv.with_suffix(".png")) if plot else None
+    # ensure logs dir
+    out_path = Path(out_csv)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # --- Run evaluation as module (ensures rl_agent imports) ---
+    # run evaluator as module; pass max-bytes/ttl/hit-ms and optional plot
+    cmd = [
+        PY_EXE, "-m", "rl_agent.evaluate",
+        "--trace", str(trace_path),
+        "--model", str(model_path),
+        "--out", str(out_path),
+        "--max-bytes", str(max_bytes),
+        "--ttl-s", str(ttl_s),
+        "--hit-ms", str(hit_ms),
+    ]
+    plot_path = None
+    if want_plot:
+        plot_path = str(out_path.with_suffix(".png"))
+        cmd += ["--plot", "--plot-save", plot_path]
+
     env = os.environ.copy()
     env["PYTHONPATH"] = str(REPO_ROOT)
-    cmd = [PY_EXE, "-m", "rl_agent.evaluate",
-           "--trace", str(trace_path),
-           "--model", str(model_path),
-           "--out", str(out_csv)]
-    if plot:
-        cmd.extend(["--plot", "--plot-save", plot_path])
-
     print("Starting eval subprocess:", " ".join(cmd))
     try:
         subprocess.check_call(cmd, env=env)
     except subprocess.CalledProcessError as e:
         raise HTTPException(status_code=500, detail=f"Evaluate failed: {e}")
 
-    # --- Parse CSV to rows ---
-    rows = []
+    # parse CSV -> rows
     try:
-        with open(out_csv, newline="") as f:
+        with open(out_path, newline="") as f:
             reader = csv.DictReader(f)
+            rows: List[Dict[str, Any]] = []
             for r in reader:
-                # convert numeric fields
-                conv = {}
-                for k, v in r.items():
-                    if v is None:
-                        conv[k] = v
-                        continue
-                    s = str(v).strip()
-                    if s == "":
-                        conv[k] = None
-                        continue
+                def num(x):
                     try:
-                        if s.isdigit():
-                            conv[k] = int(s)
-                        else:
-                            conv[k] = float(s)
+                        if x is None or str(x).strip() == "":
+                            return None
+                        if str(x).isdigit():
+                            return int(x)
+                        return float(x)
                     except Exception:
-                        conv[k] = s
-                rows.append(conv)
+                        return x
+                rows.append({
+                    "policy": r.get("policy"),
+                    "total": num(r.get("total")),
+                    "hits": num(r.get("hits")),
+                    "hit_ratio_pct": num(r.get("hit_ratio_pct")),
+                    "avg_latency_ms": num(r.get("avg_latency_ms")),
+                    "stale_pct": num(r.get("stale_pct")),
+                    "bytes_from_cache": num(r.get("bytes_from_cache")),
+                    "bytes_from_origin": num(r.get("bytes_from_origin")),
+                    "bandwidth_savings_pct": num(r.get("bandwidth_savings_pct")),
+                })
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to parse eval CSV: {e}")
+        raise HTTPException(status_code=500, detail=f"Could not read eval CSV: {e}")
 
-    # Extract ttl/drl dicts if present
-    ttl = next((r for r in rows if str(r.get("policy","")).lower()=="ttl"), None)
-    drl = next((r for r in rows if str(r.get("policy","")).lower()=="drl"), None)
-
-    # --- Update registry last_eval ---
-    ts_iso = datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
-    entries = load_registry()
-    updated = False
-    if chosen_entry:
+    # update registry.last_eval
+    if model_entry:
+        entries = load_registry()
         for e in entries:
-            if str(e.get("id")) == str(chosen_entry.get("id")):
-                e["last_eval"] = {"csv": str(out_csv), "ts": ts_iso}
-                updated = True
+            if str(e.get("id")) == str(model_entry.get("id")):
+                e["last_eval"] = {
+                    "csv": str(out_path),
+                    "ts": datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()
+                }
                 break
-    else:
-        # If model_path was direct, try to match by path
-        for e in entries:
-            if Path(e.get("path","")).resolve() == Path(model_path).resolve():
-                e["last_eval"] = {"csv": str(out_csv), "ts": ts_iso}
-                updated = True
-                break
-        # If still not found, add a light entry
-        if not updated:
-            add_model_entry(str(model_path), meta={"created_by_eval": True})
-            entries = load_registry()
-            for e in entries:
-                if Path(e.get("path","")).resolve() == Path(model_path).resolve():
-                    e["last_eval"] = {"csv": str(out_csv), "ts": ts_iso}
-                    updated = True
-                    break
-    if updated:
         save_registry(entries)
 
-    return {
-        "out": str(out_csv),
-        "rows": rows,     # <-- UI can render immediately
-        "ttl": ttl,
-        "drl": drl,
-        "plot": plot_path if plot else None,
-    }
+    resp: Dict[str, Any] = {"out": str(out_path), "rows": rows, "max_bytes": int(max_bytes)}
+    if plot_path:
+        resp["plot"] = plot_path
+    return resp
 
-
-# Optional: auto retrain poller (disabled)
-def auto_retrain_poller(poll_dir: str = str(REPO_ROOT / "simulator" / "data"), interval_s: int = 60):
-    seen = set()
-    while True:
-        files = sorted(glob.glob(os.path.join(poll_dir, "*.csv")))
-        for f in files:
-            if f not in seen:
-                seen.add(f)
-                threading.Thread(target=_train_background, args=(f, 5, f"auto_{int(time.time())}.pt"), daemon=True).start()
-        time.sleep(interval_s)
-
-# threading.Thread(target=auto_retrain_poller, daemon=True).start()
-
-# -------------------- New endpoint: read last evaluation CSV and return JSON --------------------
-
-@app.get("/api/models/report")
-def api_get_last_eval_report(model_id: Optional[str] = None):
-    """
-    Returns the last evaluation CSV (as JSON) for a given model_id.
-    If model_id omitted, attempts to return the most recent evaluation from registry.
-    Response:
-      { "csv": "<path>", "ts": "<iso>", "rows": [ {policy:..., total:..., ...}, ... ] }
-    """
+# --- Report helpers (JSON/CSV/Plot) ---
+def _resolve_last_eval_csv(model_id: Optional[str]) -> Path:
     entries = load_registry()
     chosen = None
+    last_eval = None
 
     if model_id:
         chosen = find_model_by_id(model_id)
@@ -719,59 +618,107 @@ def api_get_last_eval_report(model_id: Optional[str] = None):
         if not last_eval:
             raise HTTPException(status_code=404, detail="No evaluation recorded for this model")
     else:
-        # pick most recent entry with last_eval
         candidates = [e for e in entries if e.get("last_eval")]
         if not candidates:
             raise HTTPException(status_code=404, detail="No evaluations recorded in registry")
-        # sort by timestamp
         candidates.sort(key=lambda x: x["last_eval"].get("ts", ""), reverse=True)
         chosen = candidates[0]
         last_eval = chosen.get("last_eval")
 
     csv_path = Path(last_eval["csv"])
     if not csv_path.exists():
-        # try resolving relative to repo root or rl_agent/logs
         alt = RL_LOGS_DIR / csv_path.name
         if alt.exists():
             csv_path = alt
         else:
-            raise HTTPException(status_code=500, detail=f"Evaluation CSV not found at {csv_path}")
+            raise HTTPException(status_code=404, detail=f"Evaluation CSV not found at {csv_path}")
+    return csv_path
 
-    # parse CSV
+@app.get("/api/models/report")
+def api_get_last_eval_report(model_id: Optional[str] = None):
+    csv_path = _resolve_last_eval_csv(model_id)
+
+    # best-effort model metadata (for ts)
+    entries = load_registry()
+    chosen = find_model_by_id(model_id) if model_id else None
+    if chosen is None:
+        candidates = [e for e in entries if e.get("last_eval")]
+        candidates.sort(key=lambda x: x["last_eval"].get("ts", ""), reverse=True)
+        chosen = candidates[0] if candidates else None
+
     try:
         with open(csv_path, newline="") as csvfile:
             reader = csv.DictReader(csvfile)
-            rows = [dict(r) for r in reader]
+            def _convert_row(r: Dict[str, str]) -> Dict[str, Any]:
+                out: Dict[str, Any] = {}
+                for k, v in r.items():
+                    if v is None:
+                        out[k] = v
+                        continue
+                    s = v.strip()
+                    try:
+                        if s == "":
+                            out[k] = None
+                        elif s.isdigit():
+                            out[k] = int(s)
+                        else:
+                            out[k] = float(s)
+                    except Exception:
+                        out[k] = v
+                return out
+            rows_converted = [_convert_row(r) for r in reader]
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to read eval CSV: {e}")
 
-    # convert numeric-like fields to numbers where reasonable
-    def _convert_row(r: Dict[str, str]) -> Dict[str, Any]:
-        out = {}
-        for k, v in r.items():
-            if v is None:
-                out[k] = v
-                continue
-            s = v.strip()
-            # try int then float
-            try:
-                if s == "":
-                    out[k] = None
-                elif s.isdigit():
-                    out[k] = int(s)
-                else:
-                    # float check
-                    out[k] = float(s)
-            except Exception:
-                out[k] = v
-        return out
+    ts = None
+    if chosen and chosen.get("last_eval"):
+        ts = chosen["last_eval"].get("ts")
 
-    rows_converted = [_convert_row(r) for r in rows]
+    return {"model": chosen, "csv": str(csv_path), "ts": ts, "rows": rows_converted}
 
-    return {"model": chosen, "csv": str(csv_path), "ts": last_eval.get("ts"), "rows": rows_converted}
+@app.get("/api/models/report/csv")
+def api_report_csv(model_id: Optional[str] = None):
+    csv_path = _resolve_last_eval_csv(model_id)
+    return FileResponse(path=str(csv_path), media_type="text/csv", filename=csv_path.name)
 
-# ----------------------------------------------------------------------------------------
+@app.get("/api/models/report/plot")
+def api_report_plot(model_id: Optional[str] = None):
+    """
+    Returns/creates a PNG plot for the last evaluation CSV (bar chart).
+    Now supports multiple policies (TTL/LRU/LFU/DRL).
+    """
+    csv_path = _resolve_last_eval_csv(model_id)
+    png_path = csv_path.with_suffix(".png")
 
+    if not png_path.exists():
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+
+            with open(csv_path, newline="") as f:
+                rows = list(csv.DictReader(f))
+
+            # Build bars for hit ratio for whatever policies are present
+            policies = [r.get("policy", "").upper() for r in rows]
+            hits = []
+            for r in rows:
+                val = r.get("hit_ratio_pct", "0")
+                try:
+                    hits.append(float(val))
+                except Exception:
+                    hits.append(0.0)
+
+            fig = plt.figure()
+            plt.title("Hit Ratio (%)")
+            plt.bar(policies, hits)
+            fig.savefig(png_path)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Could not generate plot: {e}")
+
+    return FileResponse(path=str(png_path), media_type="image/png", filename=png_path.name)
+
+# --- Cache/Stats/History/Experiments/Simulate ---
 @app.get("/api/cache")
 def get_cache(db: Session = Depends(get_db)):
     rows = db.query(models.CacheItem).all()
@@ -786,13 +733,30 @@ def get_cache(db: Session = Depends(get_db)):
 
 @app.get("/api/cache/stats")
 def cache_stats(db: Session = Depends(get_db)):
-    count = db.query(func.count(models.CacheItem.id)).scalar() or 0
+    count_val = db.query(func.count(models.CacheItem.id)).scalar()
+    try:
+        items = int(count_val or 0)
+    except Exception:
+        items = int(float(count_val or 0))
+
     used = total_cache_bytes(db)
+
+    # Normalize env to int
+    try:
+        max_bytes = int(os.getenv("CACHE_MAX_BYTES", MAX_BYTES))
+    except Exception:
+        max_bytes = int(MAX_BYTES or 0)
+
+    if max_bytes <= 0:
+        pct_full = 0.0
+    else:
+        pct_full = round(100.0 * (float(used) / float(max_bytes)), 2)
+
     return {
-        "items": int(count),
+        "items": items,
         "bytes_used": int(used),
-        "max_bytes": int(MAX_BYTES),
-        "pct_full": round(100.0 * (used / MAX_BYTES), 2) if MAX_BYTES else 0.0
+        "max_bytes": int(max_bytes),
+        "pct_full": pct_full,
     }
 
 @app.get("/api/stats", response_model=StatsOut)
@@ -826,20 +790,80 @@ def get_history(window: int = Query(120, ge=10, le=3600), run_id: Optional[int] 
 def list_runs(db: Session = Depends(get_db)):
     rows = db.query(models.Run).order_by(models.Run.id.desc()).limit(20).all()
     return [
-        { "id": r.id, "started_ts": r.started_ts.isoformat(),
-          "workload": r.workload, "minutes": r.minutes, "rps": r.rps,
-          "rate": r.rate, "status": r.status }
-        for r in rows
+        {
+            "id": r.id,
+            "started_ts": r.started_ts.isoformat(),
+            "workload": r.workload,
+            "minutes": r.minutes,
+            "rps": r.rps,
+            "rate": r.rate,
+            "status": r.status,
+        } for r in rows
     ]
+
+# --- Per-run sampler: collects metrics only for this run_id/time window ---
+from threading import Event
+
+def sample_run_metrics(run_id: int, started_ts: datetime, stop_event: Event):
+    """Every second, compute metrics for requests in [started_ts, now] and
+    store StatSnapshot rows tagged with run_id. Stops when stop_event is set."""
+    hz = SAMPLE_HZ or 1
+    period = 1.0 / float(hz)
+
+    with SessionLocal() as db:
+        while not stop_event.is_set():
+            now_cutoff = datetime.now(timezone.utc)
+
+            # Metrics restricted to this run’s time window by joining Request.ts
+            hit_avg = (
+                db.query(func.avg(case((models.Outcome.cache_hit == True, 1), else_=0)))
+                  .join(models.Request, models.Outcome.request_id == models.Request.id)
+                  .filter(models.Request.ts >= started_ts, models.Request.ts <= now_cutoff)
+                  .scalar()
+                or 0.0
+            )
+            avg_latency = (
+                db.query(func.avg(models.Outcome.served_latency_ms))
+                  .join(models.Request, models.Outcome.request_id == models.Request.id)
+                  .filter(models.Request.ts >= started_ts, models.Request.ts <= now_cutoff)
+                  .scalar()
+                or 0.0
+            )
+            stale_avg = (
+                db.query(func.avg(case((models.Outcome.staleness_s > 0, 1), else_=0)))
+                  .join(models.Request, models.Outcome.request_id == models.Request.id)
+                  .filter(models.Request.ts >= started_ts, models.Request.ts <= now_cutoff)
+                  .scalar()
+                or 0.0
+            )
+
+            snap = models.StatSnapshot(
+                run_id=run_id,
+                hit_ratio_pct=round(100.0 * float(hit_avg), 2),
+                avg_latency_ms=round(float(avg_latency), 2),
+                staleness_pct=round(100.0 * float(stale_avg), 2),
+            )
+            db.add(snap)
+            db.commit()
+            time.sleep(period)
+
 
 @app.post("/api/experiments/run")
 def run_experiment(payload: dict, db: Session = Depends(get_db)):
+    # Inputs with safe defaults (preserve existing behavior if UI untouched)
     workload = payload.get("workload", "zipf")
     minutes = int(payload.get("minutes", 2))
     rps = int(payload.get("rps", 5))
     rate = int(payload.get("rate", 10))
 
-    run = models.Run(workload=workload, minutes=minutes, rps=rps, rate=rate, status="running")
+    # NEW: bigger keyspace & reproducibility
+    objects = int(payload.get("objects", 200))     # try 5000–50000 for PhD runs
+    clients = int(payload.get("clients", 50))
+    seed = payload.get("seed")                     # None or an int
+
+    run = models.Run(
+        workload=workload, minutes=minutes, rps=rps, rate=rate, status="running"
+    )
     db.add(run); db.commit(); db.refresh(run)
 
     csv_path = os.path.abspath(os.path.join(SIM_DIR, f"data/run_{run.id}.csv"))
@@ -849,30 +873,57 @@ def run_experiment(payload: dict, db: Session = Depends(get_db)):
     print(f"[DEBUG] SIM_DIR = {SIM_DIR}")
     print(f"[DEBUG] CSV_PATH = {csv_path}")
 
-    make_cmd = [PY_EXE, os.path.join(SIM_DIR, "make_csv.py"),
-                "--workload", workload, "--minutes", str(minutes),
-                "--rps", str(rps), "--objects", "200", "--clients", "50",
-                "--outfile", csv_path]
+    make_cmd = [
+        PY_EXE, os.path.join(SIM_DIR, "make_csv.py"),
+        "--workload", workload,
+        "--minutes", str(minutes),
+        "--rps", str(rps),
+        "--objects", str(objects),
+        "--clients", str(clients),
+        "--outfile", csv_path,
+    ]
+    # Pass seed if your make_csv.py supports it (optional & no-op otherwise)
+    seed = payload.get("seed")
+    if seed is not None and str("seed").strip() != "":
+        make_cmd.extend(["--seed", str(seed)])
 
-    replay_cmd = [PY_EXE, os.path.join(SIM_DIR, "replay.py"),
-                  "--file", csv_path, "--base", "http://127.0.0.1:8000",
-                  "--rate", str(rate)]
+    replay_cmd = [
+        PY_EXE, os.path.join(SIM_DIR, "replay.py"),
+        "--file", csv_path,
+        "--base", "http://127.0.0.1:8000",
+        "--rate", str(rate),
+    ]
 
     print(f"[DEBUG] make_cmd = {' '.join(make_cmd)}")
     print(f"[DEBUG] replay_cmd = {' '.join(replay_cmd)}")
 
+    # NEW: per-run sampler thread
+    stop_event = Event()
+    sampler = threading.Thread(
+        target=sample_run_metrics, args=(run.id, run.started_ts, stop_event), daemon=True
+    )
+    sampler.start()
+
     def worker():
         try:
-            print(f"[RUNNER] Running make_csv...")
-            subprocess.check_call(make_cmd)
-            print(f"[RUNNER] Running replay...")
-            subprocess.check_call(replay_cmd)
+            print("[RUNNER] Running make_csv...")
+            # Use subprocess.run with a timeout guard (minutes + 30s cushion)
+            subprocess.run(make_cmd, check=True, timeout=(minutes * 60 + 30))
+
+            print("[RUNNER] Running replay...")
+            subprocess.run(replay_cmd, check=True, timeout=(minutes * 60 + 120))
+
             run.status = "done"
             print(f"[RUNNER] ✅ Run {run.id} completed successfully.")
+        except subprocess.TimeoutExpired as te:
+            run.status = "timeout"
+            print(f"[ERROR] Run {run.id} timed out: {te}")
         except Exception as e:
             run.status = "error"
             print(f"[ERROR] Subprocess failed: {e}")
         finally:
+            # stop per-run sampler
+            stop_event.set()
             with SessionLocal() as s:
                 s.merge(run); s.commit()
                 print(f"[RUNNER] ✅ Status stored in database: {run.status}")

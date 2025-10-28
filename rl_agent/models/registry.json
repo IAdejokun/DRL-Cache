@@ -1,15 +1,15 @@
 [
   {
-    "id": "20251024032137",
-    "path": "C:\\Users\\USER\\Downloads\\ibk\\cache-project\\code\\drl-cache\\rl_agent\\models\\model_1761276054.pt",
-    "created_ts": "2025-10-24T03:21:37.378182+00:00",
+    "id": "20251027224241",
+    "path": "C:\\Users\\USER\\Downloads\\ibk\\cache-project\\code\\drl-cache\\rl_agent\\models\\model_1761602021.pt",
+    "created_ts": "2025-10-27T22:42:41.836960+00:00",
     "meta": {
       "trace": "..\\simulator\\data\\run_1.csv",
-      "epochs": 20
+      "epochs": 30
     },
     "last_eval": {
-      "csv": "C:\\Users\\USER\\Downloads\\ibk\\cache-project\\code\\drl-cache\\rl_agent\\logs\\eval_1761400430.csv",
-      "ts": "2025-10-25T13:54:06.915492+00:00"
+      "csv": "C:\\Users\\USER\\Downloads\\ibk\\cache-project\\code\\drl-cache\\rl_agent\\logs\\eval_1761630030.csv",
+      "ts": "2025-10-28T05:40:40.183875+00:00"
     }
   }
 ]

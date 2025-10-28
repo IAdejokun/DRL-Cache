@@ -81,7 +81,30 @@ def main():
     p.add_argument("--objects", type=int, default=200, help="number of distinct objects (item1..itemN)")
     p.add_argument("--clients", type=int, default=50, help="number of clients (u1..uN)")
     p.add_argument("--outfile", required=True)
+    p.add_argument("--seed", type=int, default=None, help="Optional RNG seed for reproducibility")
     args = p.parse_args()
+
+    # Optional deterministic seeding
+    if getattr(args, "seed", None) is not None:
+        try:
+            import random
+            random.seed(int(args.seed))
+        except Exception:
+            pass
+        try:
+            import numpy as np
+            np.random.seed(int(args.seed))
+        except Exception:
+            pass
+        try:
+            # If you use pandas/numpy RNG elsewhere, above is enough.
+            # If you use torch in this script, also do:
+            import torch
+            torch.manual_seed(int(args.seed))
+        except Exception:
+            pass
+        print(f"[make_csv] Seeded RNGs with {args.seed}")
+
 
     if args.workload == "zipf":
         rows = gen_zipf(args.minutes, args.rps, args.objects, args.clients)
