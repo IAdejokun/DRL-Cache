@@ -103,5 +103,5 @@ Contributions that improve policy benchmarks, expand visualisations, or tighten 
 
 ## License
 
-This repository is provided for research and experimentation purposes. Include licence details here if distributing externally.
+This repository is provided for research and experimentation purposes. 
 
